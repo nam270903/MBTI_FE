@@ -17,7 +17,8 @@ const { width } = Dimensions.get('window');
 
 // --- CONFIG ---
 const API_BASE = 'https://psychologytestbe-production.up.railway.app/api/v1';
-const STORAGE_USER_ID = 'userId';
+const KEY_DEVICE = 'deviceId';
+const KEY_USER   = 'userId';
 
 // --- TYPES ---
 interface Question {
@@ -44,11 +45,63 @@ const emojiForScore = (score: number) => {
   return map[score] || '❓';
 };
 
+const getOrCreateUser = async (): Promise<number> => {
+  // 1. fetch / create deviceId
+  let deviceId = await AsyncStorage.getItem(KEY_DEVICE);
+  if (!deviceId) {
+    deviceId = `device-${Date.now()}`;
+    await AsyncStorage.setItem(KEY_DEVICE, deviceId);
+  }
+
+  // 2. try GET user by deviceId
+  try {
+    const resp = await axios.get<{
+      code: string;
+      message: string;
+      data: { id: number }[];
+    }>(`${API_BASE}/user?device_id=${encodeURIComponent(deviceId)}`, {
+      headers: { Accept: 'application/json' },
+    });
+
+    const users = resp.data.data;
+    if (users.length > 0) {
+      const uid = users[0].id;
+      await AsyncStorage.setItem(KEY_USER, uid.toString());
+      return uid;
+    }
+  } catch {
+    // GET 404/ gen bug -> create new user
+  }
+
+  // 3. POST new email randomly 
+  const payload = {
+    full_name:      'guest',
+    email:          `${deviceId}-${Math.floor(Math.random() * 1e6)}@guest.test`,
+    password:       'random_password',
+    is_active:      true,
+    role:           'guest',
+    device_id:      deviceId,
+    firebase_token: '',
+  };
+  const create = await axios.post<{
+    code: string;
+    message: string;
+    data: { id: number };
+  }>(`${API_BASE}/user`, payload, {
+    headers: { 'Content-Type': 'application/json' },
+  });
+
+  const newId = create.data.data.id;
+  await AsyncStorage.setItem(KEY_USER, newId.toString());
+  return newId;
+};
+
 // --- COMPONENT ---
 const StartTestScreen = () => {
   const navigation = useNavigation<any>();
   const { testId } = useRoute<any>().params;
 
+  const [userId, setUserId] = useState<number | null>(null);
   const [questions, setQuestions] = useState<Question[]>([]);
   const [answersMap, setAnswersMap] = useState<Record<number, Answer[]>>({});
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -56,134 +109,107 @@ const StartTestScreen = () => {
   const [userAnswers, setUserAnswers] = useState<UserAnswer[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [userId, setUserId] = useState<number | null>(null);
 
-  // load or create userId
+  // 1) Check user/ create new user
   useEffect(() => {
     (async () => {
       try {
-        let deviceId = await AsyncStorage.getItem('deviceId');
-        if (!deviceId) {
-          deviceId = `android-${Date.now()}`;
-          await AsyncStorage.setItem('deviceId', deviceId);
-        }
-
-        const stored = await AsyncStorage.getItem(STORAGE_USER_ID);
-        if (stored) {
-          setUserId(Number(stored));
-          return;
-        }
-
-        const payload = {
-          is_active: true,
-          role: 'guest',
-          device_id: deviceId,
-          firebase_token: '',
-          full_name:'guest',
-          email:`guest_${deviceId}@app.test`,
-          password:'random_password',
-        };
-        const res = await axios.post(`${API_BASE}/user`, payload);
-        const newId = res.data.data.id;
-        await AsyncStorage.setItem(STORAGE_USER_ID, newId.toString());
-        setUserId(newId);
-      } catch (error: any) {
-        console.error('Create user error response:', error.response?.status, error.response?.data);
-        setError('Không thể tạo người dùng.');
+        const uid = await getOrCreateUser();
+        setUserId(uid);
+      } catch (e) {
+        console.error('User init error', e);
+        setError('Không thể xác thực người dùng.');
         setLoading(false);
       }
     })();
   }, []);
 
-  // fetch questions + answers
+  // 2) Load test questions and answers for checked user 
   const loadTest = useCallback(async () => {
     if (userId === null) return;
     setLoading(true);
     setError(null);
 
     try {
-      const { data: qData } = await axios.get<{ data: Question[] }>(
+      // fetch questions
+      const qRes = await axios.get<{ data: Question[] }>(
         `${API_BASE}/psychology/test/${testId}/questions`
       );
-      const qs = qData.data;
-      if (!qs.length) throw new Error('Không có câu hỏi.');
+      const qs = qRes.data.data;
+      if (qs.length === 0) throw new Error('Không có câu hỏi.');
 
       setQuestions(qs);
 
-      const map: Record<number, Answer[]> = {};
+      // fetch answers map
+      const amap: Record<number, Answer[]> = {};
       await Promise.all(
         qs.map(async (q) => {
           try {
-            const { data: aData } = await axios.get<{ data: Answer[] }>(
+            const aRes = await axios.get<{ data: Answer[] }>(
               `${API_BASE}/psychology/test/${q.id}/answer`
             );
-            map[q.id] = aData.data;
+            amap[q.id] = aRes.data.data;
           } catch {
-            map[q.id] = [];
+            amap[q.id] = [];
           }
         })
       );
-      setAnswersMap(map);
-    } catch (error: any) {
-      console.error('Load test error:', error.message || error);
-      setError(error.message || 'Không thể tải câu hỏi.');
+      setAnswersMap(amap);
+    } catch (e: any) {
+      console.error('Load test error', e);
+      setError(e.message || 'Không thể tải câu hỏi.');
     } finally {
       setLoading(false);
     }
   }, [testId, userId]);
 
   useEffect(() => {
-    if (userId !== null) {
-      loadTest();
-    }
+    if (userId !== null) loadTest();
   }, [userId, loadTest]);
 
+  // On answer selection
   const selectAnswer = (ansId: number) => {
     setSelectedId(ansId);
-    setUserAnswers((prev) => {
-      const qid = questions[currentIndex].id;
-      return [...prev.filter((u) => u.question_id !== qid), { question_id: qid, answer_id: ansId }];
-    });
+    const qid = questions[currentIndex].id;
+    setUserAnswers((prev) => [
+      ...prev.filter((u) => u.question_id !== qid),
+      { question_id: qid, answer_id: ansId },
+    ]);
   };
 
-  const submitAnswers = useCallback(async () => {
-    if (userId === null) {
-      setError('Chưa có user ID.');
-      return;
-    }
-    setLoading(true);
-    try {
-      await axios.post(`${API_BASE}/psychology/test/submit`, {
-        user_id: userId,
-        test_id: testId,
-        answers: userAnswers,
-      });
-      navigation.replace('ResultScreen', { testId });
-    } catch (error: any) {
-      console.error('Submit answers error:', error.response?.data || error.message);
-      setError('Gửi kết quả thất bại.');
-    } finally {
-      setLoading(false);
-    }
-  }, [userId, testId, userAnswers, navigation]);
-
-  const onNext = () => {
+  // Next / Submit
+  const onNext = async () => {
     if (currentIndex < questions.length - 1) {
       setSelectedId(null);
       setCurrentIndex((i) => i + 1);
     } else {
-      submitAnswers();
+      // submit
+      setLoading(true);
+      try {
+        await axios.post(`${API_BASE}/psychology/test/submit`, {
+          user_id:  userId,
+          test_id:  testId,
+          answers:  userAnswers,
+        });
+        navigation.replace('ResultScreen', { testId });
+      } catch (e: any) {
+        console.error('Submit error', e.response?.data || e.message);
+        setError('Gửi kết quả thất bại.');
+      } finally {
+        setLoading(false);
+      }
     }
   };
 
-  const currQ = questions[currentIndex];
-  const currAs = currQ ? answersMap[currQ.id] || [] : [];
-  const progress = questions.length ? ((currentIndex + 1) / questions.length) * 100 : 0;
+  // UI
+  const currQ  = questions[currentIndex];
+  const currA  = currQ ? answersMap[currQ.id] || [] : [];
+  const prog   = questions.length ? ((currentIndex + 1) / questions.length) * 100 : 0;
 
   if (loading) {
     return (
       <View style={styles.loadingContainer}>
-        <ActivityIndicator size="small" color="#6200EE" />
+        <ActivityIndicator size="large" color="#6200EE" />
       </View>
     );
   }
@@ -203,7 +229,7 @@ const StartTestScreen = () => {
       <View style={styles.header}>
         <BackButton />
         <View style={styles.barBg}>
-          <View style={[styles.barFill, { width: `${progress}%` }]} />
+          <View style={[styles.barFill, { width: `${prog}%` }]} />
         </View>
         <Text style={styles.counter}>
           {currentIndex + 1}/{questions.length}
@@ -212,7 +238,7 @@ const StartTestScreen = () => {
 
       <View style={styles.content}>
         <Text style={styles.question}>{currQ?.name}</Text>
-        {currAs.map((a) => (
+        {currA.map((a) => (
           <TouchableOpacity
             key={a.id}
             style={[styles.answer, selectedId === a.id && styles.answerSel]}
@@ -241,97 +267,22 @@ const StartTestScreen = () => {
 export default StartTestScreen;
 
 const styles = StyleSheet.create({
-  background: { flex: 1 },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingTop: 60,
-    paddingHorizontal: 16,
-    marginBottom: 12,
-  },
-  barBg: {
-    flex: 1,
-    height: 6,
-    backgroundColor: '#D0D0D0',
-    borderRadius: 3,
-    marginHorizontal: 12,
-  },
-  barFill: {
-    height: 6,
-    backgroundColor: '#0080FF',
-    borderRadius: 3,
-  },
-  counter: {
-    width: 48,
-    textAlign: 'right',
-    fontWeight: '600',
-  },
-  content: {
-    flex: 1,
-    paddingHorizontal: 20,
-  },
-  question: {
-    fontSize: 20,
-    fontWeight: '600',
-    marginBottom: 16,
-    color: '#181D22',
-  },
-  answer: {
-    backgroundColor: '#FFF',
-    padding: 15,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: '#EEE',
-    marginBottom: 12,
-  },
-  answerSel: {
-    backgroundColor: '#0080FF',
-    borderColor: '#0080FF',
-  },
-  answerText: {
-    fontSize: 16,
-    color: '#333',
-  },
-  answerTextSel: {
-    color: '#FFF',
-    fontWeight: '600',
-  },
-  next: {
-    height: 52,
-    borderRadius: 99,
-    justifyContent: 'center',
-    alignItems: 'center',
-    margin: 20,
-  },
-  nextText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#FFF',
-  },
-  loadingContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  errorContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingHorizontal: 20,
-  },
-  errorText: {
-    textAlign: 'center',
-    fontSize: 16,
-    color: 'red',
-    marginBottom: 20,
-  },
-  retryBtn: {
-    backgroundColor: '#6200EE',
-    padding: 12,
-    borderRadius: 8,
-  },
-  retryText: {
-    color: '#FFF',
-    fontWeight: '600',
-  },
+  background:     { flex: 1 },
+  header:         { flexDirection: 'row', alignItems: 'center', paddingTop: 60, paddingHorizontal: 16, marginBottom: 12 },
+  barBg:          { flex:1, height:6, backgroundColor:'#D0D0D0', borderRadius:3, marginHorizontal:12 },
+  barFill:        { height:6, backgroundColor:'#0080FF', borderRadius:3 },
+  counter:        { width:48, textAlign:'right', fontWeight:'600' },
+  content:        { flex:1, paddingHorizontal:20 },
+  question:       { fontSize:20, fontWeight:'600', marginBottom:16, color:'#181D22' },
+  answer:         { backgroundColor:'#FFF', padding:15, borderRadius:16, borderWidth:1, borderColor:'#EEE', marginBottom:12 },
+  answerSel:      { backgroundColor:'#0080FF', borderColor:'#0080FF' },
+  answerText:     { fontSize:16, color:'#333' },
+  answerTextSel:  { color:'#FFF', fontWeight:'600' },
+  next:           { height:52, borderRadius:99, justifyContent:'center', alignItems:'center', margin:20 },
+  nextText:       { fontSize:16, fontWeight:'600', color:'#FFF' },
+  loadingContainer:{ flex:1, justifyContent:'center', alignItems:'center' },
+  errorContainer: { flex:1, justifyContent:'center', alignItems:'center', paddingHorizontal:20 },
+  errorText:      { textAlign:'center', fontSize:16, color:'red', marginBottom:20 },
+  retryBtn:       { backgroundColor:'#6200EE', padding:12, borderRadius:8 },
+  retryText:      { color:'#FFF', fontWeight:'600' },
 });
